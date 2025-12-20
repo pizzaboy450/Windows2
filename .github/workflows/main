@@ -1,0 +1,40 @@
+stages:
+  - run_rdp
+  - trigger_next
+
+windows_rdp:
+  stage: run_rdp
+  tags:
+    - saas-windows-medium-amd64 # Standard GitLab Windows runner tag
+  timeout: 3h # GitLab SaaS free runners typically have a 3-hour limit
+  script:
+    - |
+      # 1. Enable RDP
+      Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+      Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+      net user runneradmin $env:VM_PASSWORD
+      
+    - |
+      # 2. Install noVNC Bridge
+      npm install -g easy-novnc
+      Start-Process easy-novnc -ArgumentList "--host localhost --port 3389 --addr :8080" -WindowStyle Hidden
+      
+    - |
+      # 3. Setup ngrok
+      # Download ngrok directly since GitLab doesn't have a marketplace action for it
+      Invoke-WebRequest bin.equinox.io -OutFile ngrok.zip
+      Expand-Archive ngrok.zip -DestinationPath .
+      .\ngrok.exe config add-authtoken $env:NGROK_AUTH_TOKEN
+      .\ngrok.exe http 8080 --log=stdout
+
+next_loop:
+  stage: trigger_next
+  when: always
+  script:
+    - |
+      # Use GitLab API to trigger a new pipeline run
+      curl --request POST "gitlab.com" \
+      --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+      --form "ref=$CI_COMMIT_REF_NAME"
+
+
