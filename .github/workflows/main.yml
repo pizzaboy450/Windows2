@@ -1,74 +1,113 @@
-name: VMOS Cloud WebDroid Setup
+name: RDP
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 */6 * * *"  # every 6 hours
 
 jobs:
-  webdroid:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
 
     steps:
-      # 1️⃣ Checkout repo (optional if HTML is stored in repo)
-      - name: Checkout repository
-        uses: actions/checkout@v3
-
-      # 2️⃣ Set up environment variables for VMOS credentials
-      - name: Setup credentials
+      - name: Configure Core RDP Settings
         run: |
-          echo "VMOS_USER=${{ secrets.VMOS_USER }}" >> $GITHUB_ENV
-          echo "VMOS_PASS=${{ secrets.VMOS_PASS }}" >> $GITHUB_ENV
-          echo "VMOS_URL=${{ secrets.VMOS_URL }}" >> $GITHUB_ENV
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-      # 3️⃣ Generate WebDroid HTML with credentials and iframe
-      - name: Generate WebDroid HTML
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
         run: |
-          cat <<EOF > webdroid.html
-          <!DOCTYPE html>
-          <html lang="en">
-          <head>
-          <meta charset="UTF-8">
-          <title>WebDroid VMOS Cloud</title>
-          <style>
-          body { margin:0; background:#000; display:flex; justify-content:center; align-items:center; height:100vh; font-family:sans-serif; }
-          #device-container { width:600px; height:1200px; border-radius:40px; background:#111; overflow:hidden; box-shadow:0 0 120px 50px rgba(255,255,255,0.2); transition:all 0.5s ease; }
-          iframe { width:100%; height:100%; border:none; }
-          #creds { position:fixed; bottom:10px; left:10px; background:rgba(34,34,34,0.85); color:#fff; padding:10px; border-radius:8px; font-size:14px; }
-          </style>
-          </head>
-          <body>
-          <div id="device-container">
-            <iframe src="\${VMOS_URL}" allowfullscreen></iframe>
-          </div>
-          <div id="creds">
-            <strong>User:</strong> \${VMOS_USER}<br>
-            <strong>Pass:</strong> \${VMOS_PASS}
-          </div>
-          <script>
-          const container = document.getElementById('device-container');
-          function resizeAndRotate() {
-            if(window.innerWidth > window.innerHeight) {
-              container.style.width = '1200px';
-              container.style.height = '800px';
-              container.style.transform='rotate(0deg)';
-            } else {
-              container.style.width = '600px';
-              container.style.height = '1200px';
-              container.style.transform='rotate(0deg)';
-            }
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
           }
-          window.addEventListener('resize', resizeAndRotate);
-          resizeAndRotate();
-          </script>
-          </body>
-          </html>
-          EOF
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
 
-      # 4️⃣ Optionally deploy to GitHub Pages or another static host
-      - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v3
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./webdroid.html
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
